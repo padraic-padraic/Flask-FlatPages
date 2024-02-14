@@ -15,6 +15,7 @@ import sys
 import unicodedata
 import unittest
 from contextlib import contextmanager
+import flask
 
 
 import six
@@ -37,67 +38,262 @@ else:
     from mock import patch
 
 
-@contextmanager
-def temp_pages(app=None, name=None):
-    """
-    This context manager gives a FlatPages object configured in a temporary
-    directory with a copy of the test pages.
+PAGES_DIR = os.path.join(os.path.dirname(__file__), "pages")
 
-    Using a temporary copy allows us to safely write and remove stuff without
-    worrying about undoing our changes.
+
+@pytest.fixture
+def flask_app():
+    app = Flask(__name__)
+    return app
+
+@pytest.fixture
+def app_context(flask_app)
+    with flask_app.app_context():
+        yield flask_app
+
+
+@pytest.fixture
+def flatpages_factory():
+    def _fp_init(app=None, name=None):
+        return FlatPages(app, name)
+    return _fp_init
+
+
+
+@pytest.fixture
+def temp_pages(tempdir, flatpages_factory):
+    shutil.copytree(PAGES_DIR, tempdir)
+    yield flatpages_factory
+
+
+@pytest.fixture
+def all_paths():
+    return set(
+        [
+            "codehilite",
+            "extra",
+            "foo",
+            "foo/42/not_a_page",
+            "foo/bar",
+            "foo/lorem/ipsum",
+            "headerid",
+            "hello",
+            "meta_styles/closing_block_only",
+            "meta_styles/yaml_style",
+            "meta_styles/jekyll_style",
+            "meta_styles/multi_line",
+            "meta_styles/no_meta",
+            "not_a_page",
+            "toc",
+        ]
+    )
+
+
+@pytest.fixture
+def paths_excluding(all_paths):
+    def filtered_paths(*args):
+        for arg in args:
+            paths = all_paths.remove(arg)
+        return paths
+    return filtered_paths
+
+
+def assert_auto_reset(pages, should_reset):
+    bar = pages.get("foo/bar")
+    assert bar.body == ""
+
+    filename = os.path.join(pages.root, "foo", "bar.html")
+    with open(filename, "w") as fd:
+        fd.write("\nrewritten")
+
+    # simulate a request (before_request functions are called)
+    # pages.reload() is not call explicitly
+    with flask.current_app.test_request_context():
+        flask.current_app.preprocess_request()
+
+    bar2 = pages.get("foo/bar")
+    if should_reset:
+        assert bar2.body == "rewritten"
+        assert bar2 is not bar
+    else:
+        assert bar2.body == ""
+        assert bar2 is bar
+
+
+def test_caching(app_context, flatpages_factory):
+    pages = flatpages_factory(app_context)
+    foo = pages.get("foo")
+    bar = pages.get("foo/bar")
+
+    filename = os.path.join(pages.root, "foo", "bar.html")
+    with open(filename, "w") as fd:
+        fd.write("\nrewritten")
+
+    pages.reload()
+
+    foo2 = pages.get("foo")
+    bar2 = pages.get("foo/bar")
+
+    # Page objects are cached and unmodified files (according to the
+    # modification date) are not parsed again.
+    assert foo2 is foo
+    assert bar2 is not bar
+    assert bar2.body != bar.body
+
+
+def test_configured_auto_reset(app_context, temp_pages):
+    app_context.config["FLATPAGES_AUTO_RELOAD"] = True
+    with temp_pages(app_context) as pages:
+        assert_auto_reset(pages)
+
+
+def test_configured_no_auto_reset(app_context, temp_pages):
+    app_context.debug = True
+    app_context.config["FLATPAGES_AUTO_RELOAD"] = False
+    with temp_pages(app_context) as pages:
+        assert_auto_reset(pages, should_reset=False)
+
+
+def test_consistency(app_context, flatpages_factory):
+    pages = flatpages_factory(app_context)
+    for page in pages:
+        assert pages.get(page.path) is page
+
+
+def test_debug_auto_reset(app_context, temp_pages):
+    app_context.debug = True
+    pages = temp_pages(app_context)
+    assert_auto_reset(pages)
+
+
+def test_default_no_auto_reset(app_context, temp_pages):
+    pages = temp_pages(app_context)
+    assert_auto_reset(pages, should_reset=False)
+
+
+@pytest.fixture
+def pages_with_extension(app_context, flatpages_factory):
+    def _initialised_pages(extensions):
+        app_context.config["FLATPAGES_EXTENSION"] = extensions
+        flatpages = flatpages_factory(app_context)
+        return set(page.path for page in flatpages)
+    yield _initialised_pages
+
+
+def test_extension_sequence(all_pages, pages_with_extension):
+    assert all_pages == pages_with_extension(['.html', '.txt'])
+
+                                        
+def test_extension_comma(all_pages, pages_with_extension):
+    assert all_pages == pages_with_extension(".html,.txt")
+
+
+def test_extension_set(all_pages, pages_with_extension):
+    assert all_pages == pages_with_extension(set([".html", ".txt"]))
+
+
+def test_extension_tuple(all_pages, pages_with_extension):
+    assert all_pages == pages_with_extension((".html", ".txt"))
+
+
+def test_catch_conflicting_paths(app_context, temp_pages):
+    app_context.config["FLATPAGES_EXTENSION"] = [".html", ".txt"]
+    with temp_pages(app_context) as pages:
+        original_file = os.path.join(pages.root, "hello.html")
+        target_file = os.path.join(pages.root, "hello.txt")
+        shutil.copyfile(original_file, target_file)
+        pages.reload()
+        with pytest.raises(ValueError):
+            pages.get("hello")
+
+
+def test_case_insensitive(app_context, temp_pages, all_pages):
+    app_context.config["FLATPAGES_EXTENSION"] = [".html", ".txt"]
+    app_context.config["FLATPAGES_CASE_INSENSITIVE"] = True
+    with temp_pages(app_context) as pages:
+        original_file = os.path.join(pages.root, "hello.html")
+        upper_file = os.path.join(pages.root, "Hello.html")
+        txt_file = os.path.join(pages.root, "hello.txt")
+        shutil.move(original_file, upper_file)
+        pages.reload()
+        assert all_pages == set(p.path for p in pages)
+        shutil.copyfile(upper_file, txt_file)
+        pages.reload()
+        with pytest.raises(ValueError):
+            pages.get("hello")
+
+
+def test_get(app_context, flatpages_factory):
+    pages = flatpages_factory(app_context)
+    assert pages.get("foo/bar").path == "foo/bar"
+    assert pages.get("nonexistent") == None
+    assert pages.get("nonexistent", 42) == 42
+
+
+def test_get_or_404(app_context, flatpages_factory):
+    pages = flatpages_factory(app_context)
+    assert pages.get_or_404("foo/bar").path == "foo/bar"
+    with pytest.raises(NotFound):
+        pages.get_or_404("nonexistant")
+
+
+def test_iter(app_context, flatpages_factory, all_pages):
+    pages = flatpages_factory(app_context)
+    assert set(p.path for p in pages) == all_pages
+
+
+def test_lazy_loading(self):
+    with temp_pages() as pages:
+        bar = pages.get("foo/bar")
+        # bar.html is normally empty
+        self.assertEqual(bar.meta, {})
+        self.assertEqual(bar.body, "")
+
+    with temp_pages() as pages:
+        filename = os.path.join(pages.root, "foo", "bar.html")
+        # write as pages is already constructed
+        with open(filename, "a") as fd:
+            fd.write("a: b\n\nc")
+        bar = pages.get("foo/bar")
+        # bar was just loaded from the disk
+        self.assertEqual(bar.meta, {"a": "b"})
+        self.assertEqual(bar.body, "c")
+
+
+def test_markdown(app_context, flatpages_factory):
+    pages = flatpages_factory(app_context)
+    foo = pages.get("foo")
+    assert foo.body == "Foo *bar*\n"
+    assert foo.html == "<p>Foo <em>bar</em></p>"
+
+
+def test_instance_relative(tempdir):
+    source = os.path.join(os.path.dirname(__file__), "pages")
+    dest = os.path.join(tempdir, "instance", "pages")
+    shutil.copytree(source, dest)
+    app = Flask(__name__, instance_path=os.path.join(tempdir, "instance"))
+    app.config["FLATPAGES_INSTANCE_RELATIVE"] = True
+    pages = FlatPages(app)
+    with app.app_context():
+        bar = pages.get("foo/bar")
+        assert bar is not None
+
+def test_multiple_instance(app_context):
     """
-    with temp_directory() as temp:
-        source = os.path.join(os.path.dirname(__file__), "pages")
-        # Remove the destination dir as copytree wants it not to exist.
-        # Doing so kind of defeats the purpose of tempfile as it introduces
-        # a race condition, but should be good enough for our purpose.
-        os.rmdir(temp)
-        shutil.copytree(source, temp)
-        app = app or Flask(__name__)
-        if name is None:
-            config_root = "FLATPAGES_ROOT"
-        else:
-            config_root = "FLATPAGES_%s_ROOT" % str(name).upper()
-        app.config[config_root] = temp
-        with app.app_context():
-            yield FlatPages(app, name)
+    This does a very basic test to see if two instances of FlatPages,
+    one default instance and one with a name, do pick up the different
+    config settings.
+    """
+    app_context.debug = True
+    app_context.config["FLATPAGES_DUMMY"] = True
+    app_context.config["FLATPAGES_FUBAR_DUMMY"] = False
+    with temp_pages(app_context) as pages:
+        assert pages.config("DUMMY") == app_context.config["FLATPAGES_DUMMY"]
+    with temp_pages(app_context, "fubar") as pages:
+        assert pages.config("DUMMY") == app_context.config["FLATPAGES_FUBAR_DUMMY"]
 
 
 class TestFlatPages(unittest.TestCase):
-    def assert_auto_reset(self, pages):
-        bar = pages.get("foo/bar")
-        self.assertEqual(bar.body, "")
-
-        filename = os.path.join(pages.root, "foo", "bar.html")
-        with open(filename, "w") as fd:
-            fd.write("\nrewritten")
-
-        # simulate a request (before_request functions are called)
-        # pages.reload() is not call explicitly
-        with pages.app.test_request_context():
-            pages.app.preprocess_request()
-
-        # updated
-        bar2 = pages.get("foo/bar")
-        self.assertEqual(bar2.body, "rewritten")
-        self.assertTrue(bar2 is not bar)
-
-    def assert_no_auto_reset(self, pages):
-        bar = pages.get("foo/bar")
-        self.assertEqual(bar.body, "")
-
-        filename = os.path.join(pages.root, "foo", "bar.html")
-        with open(filename, "w") as fd:
-            fd.write("\nrewritten")
-
-        # simulate a request (before_request functions are called)
-        with pages.app.test_request_context():
-            pages.app.preprocess_request()
-
-        # not updated
-        bar2 = pages.get("foo/bar")
-        self.assertEqual(bar2.body, "")
-        self.assertTrue(bar2 is bar)
 
     def assert_unicode(self, pages):
         hello = pages.get("hello")
@@ -109,234 +305,7 @@ class TestFlatPages(unittest.TestCase):
         # Markdown
         self.assertEqual(hello.html, "<p>Hello, <em>世界</em>!</p>")
 
-    def test_caching(self):
-        with temp_pages() as pages:
-            foo = pages.get("foo")
-            bar = pages.get("foo/bar")
 
-            filename = os.path.join(pages.root, "foo", "bar.html")
-            with open(filename, "w") as fd:
-                fd.write("\nrewritten")
-
-            pages.reload()
-
-            foo2 = pages.get("foo")
-            bar2 = pages.get("foo/bar")
-
-            # Page objects are cached and unmodified files (according to the
-            # modification date) are not parsed again.
-            self.assertTrue(foo2 is foo)
-            self.assertTrue(bar2 is not bar)
-            self.assertTrue(bar2.body != bar.body)
-
-    def test_configured_auto_reset(self):
-        app = Flask(__name__)
-        app.config["FLATPAGES_AUTO_RELOAD"] = True
-        with temp_pages(app) as pages:
-            self.assert_auto_reset(pages)
-
-    def test_configured_no_auto_reset(self):
-        app = Flask(__name__)
-        app.debug = True
-        app.config["FLATPAGES_AUTO_RELOAD"] = False
-        with temp_pages(app) as pages:
-            self.assert_no_auto_reset(pages)
-
-    def test_consistency(self):
-        app = Flask(__name__)
-        with app.app_context():
-            pages = FlatPages(app)
-            for page in pages:
-                assert pages.get(page.path) is page
-
-    def test_debug_auto_reset(self):
-        app = Flask(__name__)
-        app.debug = True
-        with temp_pages(app) as pages:
-            self.assert_auto_reset(pages)
-
-    def test_default_no_auto_reset(self):
-        with temp_pages() as pages:
-            self.assert_no_auto_reset(pages)
-
-    def test_extension_comma(self):
-        self.test_extension_sequence(".html,.txt")
-
-    def test_extension_sequence(self, extension=None):
-        app = Flask(__name__)
-        app.config["FLATPAGES_EXTENSION"] = extension or [".html", ".txt"]
-        pages = FlatPages(app)
-        with app.app_context():
-            self.assertEqual(
-                set(page.path for page in pages),
-                set(
-                    [
-                        "codehilite",
-                        "extra",
-                        "foo",
-                        "foo/42/not_a_page",
-                        "foo/bar",
-                        "foo/lorem/ipsum",
-                        "headerid",
-                        "hello",
-                        "meta_styles/closing_block_only",
-                        "meta_styles/yaml_style",
-                        "meta_styles/jekyll_style",
-                        "meta_styles/multi_line",
-                        "meta_styles/no_meta",
-                        "not_a_page",
-                        "toc",
-                    ]
-                ),
-            )
-
-    def test_extension_set(self):
-        self.test_extension_sequence(set([".html", ".txt"]))
-
-    def test_extension_tuple(self):
-        self.test_extension_sequence((".html", ".txt"))
-
-    def test_catch_conflicting_paths(self):
-        app = Flask(__name__)
-        app.config["FLATPAGES_EXTENSION"] = [".html", ".txt"]
-        with temp_pages(app) as pages:
-            original_file = os.path.join(pages.root, "hello.html")
-            target_file = os.path.join(pages.root, "hello.txt")
-            shutil.copyfile(original_file, target_file)
-            pages.reload()
-            self.assertRaises(ValueError, pages.get, "hello")
-
-    def test_case_insensitive(self):
-        app = Flask(__name__)
-        app.config["FLATPAGES_EXTENSION"] = [".html", ".txt"]
-        app.config["FLATPAGES_CASE_INSENSITIVE"] = True
-        with temp_pages(app) as pages:
-            original_file = os.path.join(pages.root, "hello.html")
-            upper_file = os.path.join(pages.root, "Hello.html")
-            txt_file = os.path.join(pages.root, "hello.txt")
-            shutil.move(original_file, upper_file)
-            pages.reload()
-            self.assertEqual(
-                set(page.path for page in pages),
-                set(
-                    [
-                        "codehilite",
-                        "extra",
-                        "foo",
-                        "foo/42/not_a_page",
-                        "foo/bar",
-                        "foo/lorem/ipsum",
-                        "headerid",
-                        "hello",
-                        "meta_styles/closing_block_only",
-                        "meta_styles/yaml_style",
-                        "meta_styles/jekyll_style",
-                        "meta_styles/multi_line",
-                        "meta_styles/no_meta",
-                        "not_a_page",
-                        "toc",
-                    ]
-                ),
-            )
-            shutil.copyfile(upper_file, txt_file)
-            pages.reload()
-            self.assertRaises(ValueError, pages.get, "hello")
-
-    def test_get(self):
-        app = Flask(__name__)
-        pages = FlatPages(app)
-        with app.app_context():
-            self.assertEqual(pages.get("foo/bar").path, "foo/bar")
-            self.assertEqual(pages.get("nonexistent"), None)
-            self.assertEqual(pages.get("nonexistent", 42), 42)
-
-    def test_get_or_404(self):
-        app = Flask(__name__)
-        pages = FlatPages(app)
-        with app.app_context():
-            self.assertEqual(pages.get_or_404("foo/bar").path, "foo/bar")
-            self.assertRaises(NotFound, pages.get_or_404, "nonexistent")
-
-    def test_iter(self):
-        app = Flask(__name__)
-        pages = FlatPages(app)
-        with app.app_context():
-            self.assertEqual(
-                set(page.path for page in pages),
-                set(
-                    [
-                        "codehilite",
-                        "extra",
-                        "foo",
-                        "foo/bar",
-                        "foo/lorem/ipsum",
-                        "headerid",
-                        "hello",
-                        "meta_styles/closing_block_only",
-                        "meta_styles/yaml_style",
-                        "meta_styles/jekyll_style",
-                        "meta_styles/multi_line",
-                        "meta_styles/no_meta",
-                        "toc",
-                    ]
-                ),
-            )
-
-    def test_lazy_loading(self):
-        with temp_pages() as pages:
-            bar = pages.get("foo/bar")
-            # bar.html is normally empty
-            self.assertEqual(bar.meta, {})
-            self.assertEqual(bar.body, "")
-
-        with temp_pages() as pages:
-            filename = os.path.join(pages.root, "foo", "bar.html")
-            # write as pages is already constructed
-            with open(filename, "a") as fd:
-                fd.write("a: b\n\nc")
-            bar = pages.get("foo/bar")
-            # bar was just loaded from the disk
-            self.assertEqual(bar.meta, {"a": "b"})
-            self.assertEqual(bar.body, "c")
-
-    def test_markdown(self):
-        app = Flask(__name__)
-        pages = FlatPages(app)
-        with app.app_context():
-            foo = pages.get("foo")
-            self.assertEqual(foo.body, "Foo *bar*\n")
-            self.assertEqual(foo.html, "<p>Foo <em>bar</em></p>")
-
-    def test_instance_relative(self):
-        with temp_directory() as temp:
-            source = os.path.join(os.path.dirname(__file__), "pages")
-            dest = os.path.join(temp, "instance", "pages")
-            shutil.copytree(source, dest)
-            app = Flask(__name__, instance_path=os.path.join(temp, "instance"))
-            app.config["FLATPAGES_INSTANCE_RELATIVE"] = True
-            pages = FlatPages(app)
-            with app.app_context():
-                bar = pages.get("foo/bar")
-                self.assertTrue(bar is not None)
-
-    def test_multiple_instance(self):
-        """
-        This does a very basic test to see if two instances of FlatPages,
-        one default instance and one with a name, do pick up the different
-        config settings.
-        """
-        app = Flask(__name__)
-        app.debug = True
-        app.config["FLATPAGES_DUMMY"] = True
-        app.config["FLATPAGES_FUBAR_DUMMY"] = False
-        with temp_pages(app) as pages:
-            self.assertEqual(
-                pages.config("DUMMY"), app.config["FLATPAGES_DUMMY"]
-            )
-        with temp_pages(app, "fubar") as pages:
-            self.assertEqual(
-                pages.config("DUMMY"), app.config["FLATPAGES_FUBAR_DUMMY"]
-            )
 
     @patch(
         "flask_flatpages.flatpages.FlatPages._legacy_parser",

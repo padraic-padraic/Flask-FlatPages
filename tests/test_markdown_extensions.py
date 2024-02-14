@@ -9,7 +9,7 @@ Test proper work of various Markdown extensions.
 
 import sys
 import unittest
-from collections.abc import Generator
+
 
 import markdown
 import pytest
@@ -17,7 +17,6 @@ from flask import Flask
 from flask_flatpages import FlatPages
 from flask_flatpages.imports import PygmentsHtmlFormatter
 from markdown.extensions.toc import TocExtension
-from six import PY3
 
 
 class TestMarkdownExtensions(unittest.TestCase):
